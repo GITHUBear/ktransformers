@@ -14,7 +14,7 @@ dev_install:
 
 # install ktransformers
 	echo "Installing python dependencies from requirements.txt"
-	pip install -r requirements-local_chat.txt
+	pip install -r requirements-local_chat.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 	echo "Installing ktransformers"
 	KTRANSFORMERS_FORCE_BUILD=TRUE pip install -e . -v --no-build-isolation

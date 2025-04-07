@@ -29,9 +29,9 @@ struct MOEConfig {
     int routed_expert_num;
     int hidden_size;
     int intermediate_size;
-    int stride;
-    int group_min_len;
-    int group_max_len;
+    int stride;         // 64
+    int group_min_len;  // 10
+    int group_max_len;  // 1024
     void* gate_proj;
     void* up_proj;
     void* down_proj;
@@ -54,6 +54,9 @@ class MOE {
     void forward_one(int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend);
     void forward_many(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend);
     void forward(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend);
+#ifdef USE_NUMA
+    static void* numa_alloc_huge_pages(size_t mem_size, int numa_id);
+#endif
 
    private:
     MOEConfig config_;

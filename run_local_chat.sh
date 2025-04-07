@@ -1,0 +1,1 @@
+python ktransformers/local_chat.py --model_path deepseek-ai/DeepSeek-V3 --gguf_path /data/shanhaikang.shk/model/DeepSeek-R1-q4km-fp8/ --optimize_config_path ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-fp8-linear-ggml-experts.yaml --cpu_infer 65

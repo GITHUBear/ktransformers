@@ -32,6 +32,7 @@ from ktransformers.util.utils import prefill_and_generate, get_compute_capabilit
 from ktransformers.server.config.config import Config
 from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
 from ktransformers.util.vendors import device_manager, get_device, to_device, GPUVendor
+from torch.profiler import profile, record_function, ProfilerActivity
 
 custom_models = {
     "DeepseekV2ForCausalLM": DeepseekV2ForCausalLM,
@@ -170,6 +171,13 @@ def local_chat(
             assert Config().long_context_config['max_seq_len'] > input_tensor.shape[1] + max_new_tokens, \
             "please change max_seq_len in  ~/.ktransformers/config.yaml"
         
+        # with profile(
+        #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        #     with_stack=True,
+        #     profile_memory=True,
+        #     record_shapes=True,
+        #     with_flops=True
+        # ) as prof:
         if system != "Windows" and (config.architectures[0] == "DeepseekV2ForCausalLM" or config.architectures[0] == "DeepseekV3ForCausalLM") and flashinfer_enabled and get_compute_capability() >= 8 and device_manager.gpu_vendor == GPUVendor.NVIDIA:
             generated = prefill_and_generate(
                 model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph, mode = mode, force_think = force_think, chunk_prefill_size = chunk_prefill_size,
@@ -179,6 +187,9 @@ def local_chat(
             generated = prefill_and_generate(
                 model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph, mode = mode, force_think = force_think, chunk_prefill_size = chunk_prefill_size,
             )
+        
+        torch.cuda.synchronize()
+        # prof.export_chrome_trace("./trace.json")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,32 @@
 #include <numa.h>
 #include <numaif.h>
 #endif
+#include <sys/mman.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+
+#ifdef USE_NUMA
+void* MOE::numa_alloc_huge_pages(size_t mem_size, int numa_id)
+{
+    void *ptr = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                     -1, 0);
+    if (ptr == MAP_FAILED) {
+        perror("mmap(HUGETLB) failed");
+        return NULL;
+    }
+
+    unsigned long nodemask = (1UL << numa_id); // 目标节点的位掩码
+    if (mbind(ptr, mem_size, MPOL_BIND, &nodemask, sizeof(nodemask)*8, MPOL_MF_MOVE)) {
+        perror("mbind failed");
+        munmap(ptr, mem_size);
+        return NULL;
+    }
+
+    return ptr;
+}
+#endif
 
 MOE::MOE(MOEConfig config) {
     config_ = config;
@@ -23,15 +49,19 @@ MOE::MOE(MOEConfig config) {
     down_proj_ = config_.down_proj;
     
     #ifdef USE_NUMA
+    printf("======================= Enable NUMA =====================\n");
     int numa_nodes = numa_num_configured_nodes();
     gate_proj_numa_.resize(numa_nodes);
     up_proj_numa_.resize(numa_nodes);
     down_proj_numa_.resize(numa_nodes);
     size_t exp_inter_hidden_mul_ = (size_t)config.expert_num * config.intermediate_size * config.hidden_size;
+    printf("gate_proj_numa_ size: %ld\n", exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
+    printf("up_proj_numa_ size: %ld\n", exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
+    printf("down_proj_numa_ size: %ld\n", exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
     for (int i = 0; i < numa_nodes; i++) {
-        gate_proj_numa_[i] = numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
-        up_proj_numa_[i] = numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
-        down_proj_numa_[i] = numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
+        gate_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
+        up_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
+        down_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
         if (!gate_proj_numa_[i]) {
             std::cout << "Memory allocation failed for gate_proj_numa_ on node " << i << std::endl;
         }
@@ -45,6 +75,7 @@ MOE::MOE(MOEConfig config) {
         memcpy(up_proj_numa_[i], up_proj_, exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
         memcpy(down_proj_numa_[i], down_proj_, exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
     }
+    printf("========================================================\n");
     #endif
 
     std::vector<std::pair<void**, uint64_t>> s_mem_requests;
@@ -159,15 +190,24 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             }
         }
     }
+    // moe_intermediate_size=2048,
+    // stride = 64
+    // nth = 2^5 = 32
+    // k = 8
     int nth = config_.intermediate_size / config_.stride;
+    // k 个 expert 每个 expert 将中间hidden层的计算切成32个长度为64的条带，并行计算
     backend->do_work_stealing_job(nth * k, nullptr, [&](int task_id) {
         int expert_idx = task_id / nth;
         uint64_t expert_id = expert_ids[expert_idx];
         int ith = task_id % nth;
+        // expert_id号expert的第ith条带的计算
         
         #ifdef USE_NUMA
+        // 使用numa的话就会从距离当前线程最近的内存地址上获取
         void* gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
         #else
+        // 不使用 numa 时
+        // gate_proj shape [experts_size, interm_size, hidden_size]
         void* gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
         #endif
 
@@ -344,10 +384,30 @@ void MOE::forward_many(int qlen, int k, const uint64_t* expert_ids, const float*
 void MOE::forward(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend) {
     if (qlen < config_.group_min_len) {
         for (int i = 0; i < qlen; i++) {
+            // qlen = batchsize * seqlen
+            // k 选中的专家数
+            // expert_ids + i * k 一个hidden state对应的选中的expert id列表
+            // weights + i * k 一个hidden state对应的选中的expert的权重
+            // 注意原来的 input 的 shape 为 batch_size * seq_len * hidden_state
+            // 不过在experts.py:820中，前两维度被合并：
+            // class KDeepseekV3MoE(BaseInjectedModule, DeepseekV3MoE):
+            
+            // def forward(self, hidden_states):
+            //     identity = hidden_states
+            //     orig_shape = hidden_states.shape
+            //     sequence_length = orig_shape[1]
+            //     topk_idx, topk_weight = self.gate(hidden_states)
+            //     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            // hidden_size=4096 hidden_type=GGML_TYPE_BF16
+            // .blck_size                = 1,
+            // .type_size                = 2,
             forward_one(k, expert_ids + i * k, weights + i * k, (uint8_t*)input + i * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), (uint8_t*)output + i * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), backend);
         }
         return;
     }
+    // TODO: remove this
+    assert(false); // Optimize forward_one first.
+
     int forward_len = std::min(config_.group_max_len, qlen);
     forward_many(forward_len, k, expert_ids, weights, input, output, backend);
     forward(qlen - forward_len, k, expert_ids + forward_len * k, weights + forward_len * k, (uint8_t*)input + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), (uint8_t*)output + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), backend);
