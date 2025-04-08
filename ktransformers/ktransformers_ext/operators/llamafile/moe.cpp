@@ -55,13 +55,39 @@ MOE::MOE(MOEConfig config) {
     up_proj_numa_.resize(numa_nodes);
     down_proj_numa_.resize(numa_nodes);
     size_t exp_inter_hidden_mul_ = (size_t)config.expert_num * config.intermediate_size * config.hidden_size;
-    printf("gate_proj_numa_ size: %ld\n", exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
-    printf("up_proj_numa_ size: %ld\n", exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
-    printf("down_proj_numa_ size: %ld\n", exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
+    printf("gate_proj_numa_ size: %ld\n", exp_inter_hidden_mul_);
+    printf("up_proj_numa_ size: %ld\n", exp_inter_hidden_mul_);
+    printf("down_proj_numa_ size: %ld\n", exp_inter_hidden_mul_);
+    size_t gate_ele_size = 0, up_ele_size = 0, down_ele_size = 0;
+    for (int i = 0; i < numa_nodes; ++i) {
+        size_t gate_node_ele_size = config_.gate_proj_element_size_on_numa_node(i);
+        size_t up_node_ele_size = config_.up_proj_element_size_on_numa_node(i);
+        size_t down_node_ele_size = config_.down_proj_element_size_on_numa_node(i);
+        printf("numa-node[%d] gate_node_ele_size=%ld up_node_ele_size=%ld down_node_ele_size=%ld\n", i, gate_node_ele_size, up_node_ele_size, down_node_ele_size);
+        gate_ele_size += gate_node_ele_size;
+        up_ele_size += up_node_ele_size;
+        down_ele_size += down_node_ele_size;
+    }
+
+    if (exp_inter_hidden_mul_ != gate_ele_size) {
+        printf("gate_ele_size: %ld expected, get %ld\n", exp_inter_hidden_mul_, gate_ele_size);
+        exit(EXIT_FAILURE);
+    }
+
+    if (exp_inter_hidden_mul_ != up_ele_size) {
+        printf("up_ele_size: %ld expected, get %ld\n", exp_inter_hidden_mul_, up_ele_size);
+        exit(EXIT_FAILURE);
+    }
+
+    if (exp_inter_hidden_mul_ != down_ele_size) {
+        printf("down_ele_size: %ld expected, get %ld\n", exp_inter_hidden_mul_, down_ele_size);
+        exit(EXIT_FAILURE);
+    }
+
     for (int i = 0; i < numa_nodes; i++) {
-        gate_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
-        up_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
-        down_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
+        gate_proj_numa_[i] = MOE::numa_alloc_huge_pages(config_.gate_proj_element_size_on_numa_node(i) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
+        up_proj_numa_[i] = MOE::numa_alloc_huge_pages(config_.up_proj_element_size_on_numa_node(i) * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
+        down_proj_numa_[i] = MOE::numa_alloc_huge_pages(config_.down_proj_element_size_on_numa_node(i) * ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
         if (!gate_proj_numa_[i]) {
             std::cout << "Memory allocation failed for gate_proj_numa_ on node " << i << std::endl;
         }

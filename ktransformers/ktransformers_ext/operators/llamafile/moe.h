@@ -24,11 +24,16 @@
 #include "llamafile/sgemm.h"
 #include "shared_mem_buffer.h"
 
+#ifdef USE_NUMA
+#include <numa.h>
+#include <numaif.h>
+#endif
+
 struct MOEConfig {
     int expert_num;
     int routed_expert_num;
-    int hidden_size;
-    int intermediate_size;
+    int hidden_size;       // 7168
+    int intermediate_size; // 2048
     int stride;         // 64
     int group_min_len;  // 10
     int group_max_len;  // 1024
@@ -40,10 +45,108 @@ struct MOEConfig {
     ggml_type down_type;
     ggml_type hidden_type;
 
+#ifdef USE_NUMA
+    int e_n_numa_nodes;
+    
+    int e_n_gate_proj_strides_per_expert;
+    int e_n_gate_proj_strides_per_expert_per_node;
+    int e_n_gate_remain_nodes;
+
+    int e_n_up_proj_strides_per_expert;
+    int e_n_up_proj_strides_per_expert_per_node; // = e_n_gate_proj_strides_per_expert_per_node
+    int e_n_up_remain_nodes;
+
+    int e_n_down_proj_strides_per_expert;
+    int e_n_down_proj_strides_per_expert_per_node;
+    int e_n_down_remain_nodes;
+#endif
+
     MOEConfig() {}
 
     MOEConfig(int expert_num, int routed_expert_num, int hidden_size, int intermediate_size, int stride, int group_min_len, int group_max_len, void* gate_proj, void* up_proj, void* down_proj, ggml_type gate_type, ggml_type up_type, ggml_type down_type, ggml_type hidden_type)
-        : expert_num(expert_num), routed_expert_num(routed_expert_num), hidden_size(hidden_size), intermediate_size(intermediate_size), stride(stride), group_min_len(group_min_len), group_max_len(group_max_len), gate_proj(gate_proj), up_proj(up_proj), down_proj(down_proj), gate_type(gate_type), up_type(up_type), down_type(down_type), hidden_type(hidden_type) {}
+        : expert_num(expert_num), routed_expert_num(routed_expert_num), hidden_size(hidden_size), intermediate_size(intermediate_size), stride(stride), group_min_len(group_min_len), group_max_len(group_max_len), gate_proj(gate_proj), up_proj(up_proj), down_proj(down_proj), gate_type(gate_type), up_type(up_type), down_type(down_type), hidden_type(hidden_type) {
+#ifdef USE_NUMA
+        e_n_numa_nodes = numa_num_configured_nodes();
+        if (e_n_numa_nodes <= 0) {
+            printf("[MOE] No NUMA nodes configured\n");
+            exit(EXIT_FAILURE);
+        }
+
+        e_n_gate_proj_strides_per_expert = intermediate_size / stride;
+        int avg_gate_proj_strides_per_expert_per_node = e_n_gate_proj_strides_per_expert / e_n_numa_nodes;
+        e_n_gate_remain_nodes = e_n_gate_proj_strides_per_expert % e_n_numa_nodes;
+        e_n_gate_proj_strides_per_expert_per_node = (e_n_gate_remain_nodes > 0) ? avg_gate_proj_strides_per_expert_per_node + 1 : avg_gate_proj_strides_per_expert_per_node;
+
+        e_n_up_proj_strides_per_expert = intermediate_size / stride;
+        int avg_up_proj_strides_per_expert_per_node = e_n_up_proj_strides_per_expert / e_n_numa_nodes;
+        e_n_up_remain_nodes = e_n_up_proj_strides_per_expert % e_n_numa_nodes;
+        e_n_up_proj_strides_per_expert_per_node = (e_n_up_remain_nodes > 0) ? avg_up_proj_strides_per_expert_per_node + 1 : avg_up_proj_strides_per_expert_per_node;
+
+        e_n_down_proj_strides_per_expert = hidden_size / stride;
+        int avg_down_proj_strides_per_expert_per_node = e_n_down_proj_strides_per_expert / e_n_numa_nodes;
+        e_n_down_remain_nodes = e_n_down_proj_strides_per_expert % e_n_numa_nodes;
+        e_n_down_proj_strides_per_expert_per_node = (e_n_down_remain_nodes > 0) ? avg_down_proj_strides_per_expert_per_node + 1 : avg_down_proj_strides_per_expert_per_node;
+#endif
+    }
+
+#ifdef USE_NUMA
+    int gate_stride_numa_node_by_stride_id(int stride_id, int& num_strides) {
+        if (e_n_gate_remain_nodes == 0 ||
+            stride_id < e_n_gate_remain_nodes * e_n_gate_proj_strides_per_expert_per_node) {
+            num_strides = e_n_gate_proj_strides_per_expert_per_node;
+            return stride_id / e_n_gate_proj_strides_per_expert_per_node;
+        }
+
+        num_strides = e_n_gate_proj_strides_per_expert_per_node - 1;
+        return e_n_gate_remain_nodes + (stride_id - e_n_gate_remain_nodes * e_n_gate_proj_strides_per_expert_per_node) / num_strides;
+    }
+
+    int up_stride_numa_node_by_stride_id(int stride_id, int& num_strides) {
+        if (e_n_up_remain_nodes == 0 ||
+            stride_id < e_n_up_remain_nodes * e_n_up_proj_strides_per_expert_per_node) {
+            num_strides = e_n_up_proj_strides_per_expert_per_node;
+            return stride_id / e_n_up_proj_strides_per_expert_per_node;
+        }
+
+        num_strides = e_n_up_proj_strides_per_expert_per_node - 1;
+        return e_n_up_remain_nodes + (stride_id - e_n_up_remain_nodes * e_n_up_proj_strides_per_expert_per_node) / num_strides;
+    }
+
+    int down_stride_numa_node_by_stride_id(int stride_id, int& num_strides) {
+        if (e_n_down_remain_nodes == 0 ||
+            stride_id < e_n_down_remain_nodes * e_n_down_proj_strides_per_expert_per_node) {
+            num_strides = e_n_down_proj_strides_per_expert_per_node;
+            return stride_id / e_n_down_proj_strides_per_expert_per_node;
+        }
+
+        num_strides = e_n_down_proj_strides_per_expert_per_node - 1;
+        return e_n_down_remain_nodes + (stride_id - e_n_down_remain_nodes * e_n_down_proj_strides_per_expert_per_node) / num_strides;
+    }
+
+    size_t gate_proj_element_size_on_numa_node(int numa_node_id) {
+        if (e_n_gate_remain_nodes == 0 ||
+            numa_node_id < e_n_gate_remain_nodes) {
+            return (size_t)expert_num * e_n_gate_proj_strides_per_expert_per_node * stride * hidden_size;
+        }
+        return (size_t)expert_num * (e_n_gate_proj_strides_per_expert_per_node - 1) * stride * hidden_size;
+    }
+
+    size_t up_proj_element_size_on_numa_node(int numa_node_id) {
+        if (e_n_up_remain_nodes == 0 ||
+            numa_node_id < e_n_up_remain_nodes) {
+            return (size_t)expert_num * e_n_up_proj_strides_per_expert_per_node * stride * hidden_size;
+        }
+        return (size_t)expert_num * (e_n_up_proj_strides_per_expert_per_node - 1) * stride * hidden_size;
+    }
+
+    size_t down_proj_element_size_on_numa_node(int numa_node_id) {
+        if (e_n_down_remain_nodes == 0 ||
+            numa_node_id < e_n_down_remain_nodes) {
+            return (size_t)expert_num * e_n_down_proj_strides_per_expert_per_node * stride * intermediate_size;
+        }
+        return (size_t)expert_num * (e_n_down_proj_strides_per_expert_per_node - 1) * stride * intermediate_size;
+    }
+#endif
 };
 
 class MOE {
