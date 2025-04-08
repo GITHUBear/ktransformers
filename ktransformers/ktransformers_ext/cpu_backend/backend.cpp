@@ -13,6 +13,10 @@
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
+#include <sched.h>
+#include <cstdio>
+#include <cassert>
+#include <cstdlib>
 
 thread_local int Backend::numa_node = -1;
 #endif
@@ -88,8 +92,12 @@ void Backend::do_work_stealing_job(int task_num,
 void Backend::process_tasks(int thread_id) {
     
     #ifdef USE_NUMA
-    if(numa_node == -1){
-        numa_node = thread_id * numa_num_configured_nodes() / thread_num_;
+    if (numa_node == -1) {
+        if (thread_id != 0) {
+            printf("Only thread-0's numa node is not set, while get thread_id: %d\n", thread_id);
+            exit(EXIT_FAILURE);
+        }
+        numa_node = 0;
         struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
         numa_bitmask_setbit(mask, numa_node);
         numa_bind(mask);
@@ -130,6 +138,29 @@ void Backend::process_tasks(int thread_id) {
 }
 
 void Backend::worker_thread(int thread_id) {
+#ifdef USE_NUMA
+    // bind numa here
+    const int num_numa_node = numa_num_configured_nodes();
+    if (num_numa_node <= 0) {
+        printf("No NUMA nodes configured\n");
+        exit(EXIT_FAILURE);
+    }
+
+    const int base_thread_cnt_per_numa = max_thread_num_ / num_numa_node;
+    const int base_thread_cnt = base_thread_cnt_per_numa * num_numa_node;
+    int numa_node_id = (thread_id < base_thread_cnt) ? (thread_id / base_thread_cnt_per_numa) : (thread_id - base_thread_cnt);
+    printf("thread-[%d]: base_thread_cnt_per_numa=%d, base_thread_cnt=%d, numa_node_id=%d\n", thread_id, base_thread_cnt_per_numa, base_thread_cnt, numa_node_id);
+    if (numa_node_id < 0 || numa_node_id >= num_numa_node) {
+        printf("Invalid numa node id: %d\n", numa_node_id);
+        exit(EXIT_FAILURE);
+    }
+
+    struct bitmask* mask = numa_bitmask_alloc(num_numa_node);
+    numa_bitmask_setbit(mask, numa_node_id);
+    numa_bind(mask);
+
+    numa_node = numa_node_id;
+#endif
     auto start = std::chrono::steady_clock::now();
     thread_local_id = thread_id; // 设置线程本地变量
     while (true) {
