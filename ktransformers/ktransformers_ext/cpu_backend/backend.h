@@ -39,7 +39,19 @@ class Backend {
                               std::function<void(int)>,
                               std::function<void(int)>);
     #ifdef USE_NUMA
+    void do_work_stealing_job_numa_aware(
+      int, 
+      std::vector<int>&,
+      std::function<void(int)>,
+      std::function<void(int)>,
+      std::function<void(int)>
+    );
+    
     static thread_local int numa_node;
+    
+    std::mutex mux;
+    std::vector<std::vector<int>> threads_on_each_numa_node;
+    std::atomic<int> numa_info_ready_cnter{1};
     #endif
     static thread_local int thread_local_id;
 

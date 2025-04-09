@@ -27,6 +27,7 @@
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
+#include <vector>
 #endif
 
 struct MOEConfig {
@@ -101,6 +102,14 @@ struct MOEConfig {
         return e_n_gate_remain_nodes + (stride_id - e_n_gate_remain_nodes * e_n_gate_proj_strides_per_expert_per_node) / num_strides;
     }
 
+    int gate_num_stride_on_numa_node(int numa_node_id) {
+        if (e_n_gate_remain_nodes == 0 ||
+            numa_node_id < e_n_gate_remain_nodes) {
+            return e_n_gate_proj_strides_per_expert_per_node;
+        }
+        return e_n_gate_proj_strides_per_expert_per_node - 1;
+    }
+
     int up_stride_numa_node_by_stride_id(int stride_id, int& num_strides) {
         if (e_n_up_remain_nodes == 0 ||
             stride_id < e_n_up_remain_nodes * e_n_up_proj_strides_per_expert_per_node) {
@@ -112,6 +121,14 @@ struct MOEConfig {
         return e_n_up_remain_nodes + (stride_id - e_n_up_remain_nodes * e_n_up_proj_strides_per_expert_per_node) / num_strides;
     }
 
+    int up_num_stride_on_numa_node(int numa_node_id) {
+        if (e_n_up_remain_nodes == 0 ||
+            numa_node_id < e_n_up_remain_nodes) {
+            return e_n_up_proj_strides_per_expert_per_node;
+        }
+        return e_n_up_proj_strides_per_expert_per_node - 1;
+    }
+
     int down_stride_numa_node_by_stride_id(int stride_id, int& num_strides) {
         if (e_n_down_remain_nodes == 0 ||
             stride_id < e_n_down_remain_nodes * e_n_down_proj_strides_per_expert_per_node) {
@@ -121,6 +138,14 @@ struct MOEConfig {
 
         num_strides = e_n_down_proj_strides_per_expert_per_node - 1;
         return e_n_down_remain_nodes + (stride_id - e_n_down_remain_nodes * e_n_down_proj_strides_per_expert_per_node) / num_strides;
+    }
+
+    int down_num_stride_on_numa_node(int numa_node_id) {
+        if (e_n_down_remain_nodes == 0 ||
+            numa_node_id < e_n_down_remain_nodes) {
+            return e_n_down_proj_strides_per_expert_per_node;
+        }
+        return e_n_down_proj_strides_per_expert_per_node - 1;
     }
 
     size_t gate_proj_element_size_on_numa_node(int numa_node_id) {

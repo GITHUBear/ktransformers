@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <iostream>
 
 #ifdef USE_NUMA
 void* MOE::numa_alloc_huge_pages(size_t mem_size, int numa_id)
@@ -86,8 +87,11 @@ MOE::MOE(MOEConfig config) {
 
     for (int i = 0; i < numa_nodes; i++) {
         gate_proj_numa_[i] = MOE::numa_alloc_huge_pages(config_.gate_proj_element_size_on_numa_node(i) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
+        // printf("########## alloc gate_proj_numa_[%d]: 0x%p size: %ld type_size: %ld block_size: %ld\n", i, gate_proj_numa_[i], config_.gate_proj_element_size_on_numa_node(i), ggml_type_size(config.gate_type), ggml_blck_size(config.gate_type));
         up_proj_numa_[i] = MOE::numa_alloc_huge_pages(config_.up_proj_element_size_on_numa_node(i) * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
-        down_proj_numa_[i] = MOE::numa_alloc_huge_pages(config_.down_proj_element_size_on_numa_node(i) * ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
+        // printf("########## alloc up_proj_numa_[%d]: 0x%p size: %ld type_size: %ld block_size: %ld\n", i, up_proj_numa_[i], config_.up_proj_element_size_on_numa_node(i), ggml_type_size(config.up_type), ggml_blck_size(config.up_type));
+        // Deal with gate and up firstly.
+        down_proj_numa_[i] = MOE::numa_alloc_huge_pages(exp_inter_hidden_mul_ * ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
         if (!gate_proj_numa_[i]) {
             std::cout << "Memory allocation failed for gate_proj_numa_ on node " << i << std::endl;
         }
@@ -97,9 +101,73 @@ MOE::MOE(MOEConfig config) {
         if (!down_proj_numa_[i]) {
             std::cout << "Memory allocation failed for down_proj_numa_ on node " << i << std::endl;
         }
-        memcpy(gate_proj_numa_[i], gate_proj_, exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
-        memcpy(up_proj_numa_[i], up_proj_, exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
+        // memcpy(gate_proj_numa_[i], gate_proj_, exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
+        // memcpy(up_proj_numa_[i], up_proj_, exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
         memcpy(down_proj_numa_[i], down_proj_, exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
+    }
+
+    for (size_t expert_id = 0; expert_id < config_.expert_num; ++expert_id) {
+        size_t gate_stride_offset_per_expert = 0;
+        size_t up_stride_offset_per_expert = 0;
+        for (int numa_node_id = 0; numa_node_id < numa_nodes; ++numa_node_id) {
+            int n_gate_stride_per_expert = config_.gate_num_stride_on_numa_node(numa_node_id);
+            int n_up_stride_per_expert = config_.up_num_stride_on_numa_node(numa_node_id);
+            
+            void* gate_data_ptr = (uint8_t*)gate_proj_ + (
+                expert_id * config_.intermediate_size * config_.hidden_size + 
+                gate_stride_offset_per_expert * config_.stride * config_.hidden_size
+            ) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type);
+            void* up_data_ptr = (uint8_t*)up_proj_ + (
+                expert_id * config_.intermediate_size * config_.hidden_size + 
+                up_stride_offset_per_expert * config_.stride * config_.hidden_size
+            ) * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type);
+
+            void* numa_gate_data_ptr = (uint8_t*)(gate_proj_numa_[numa_node_id]) + (
+                expert_id * n_gate_stride_per_expert * config_.stride * config_.hidden_size
+            ) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type);
+            size_t bytes_gate_copy = n_gate_stride_per_expert * config_.stride * config_.hidden_size * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type);
+            // printf("########## copy size:%ld gate_proj_(0x%p, expert_offset:%ld + internal_offset: %ld) to  gate_proj_numa_[%d](0x%p, offset: %ld)\n", 
+            //         bytes_gate_copy, 
+            //         gate_proj_,
+            //         (
+            //             expert_id * config_.intermediate_size * config_.hidden_size
+            //         ) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type),
+            //         (
+            //             gate_stride_offset_per_expert * config_.stride * config_.hidden_size
+            //         ) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type),
+            //         numa_node_id,
+            //         gate_proj_numa_[numa_node_id],
+            //         (
+            //             expert_id * n_gate_stride_per_expert * config_.stride * config_.hidden_size
+            //         ) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type)
+            // );
+
+            void* numa_up_data_ptr = (uint8_t*)(up_proj_numa_[numa_node_id]) + (
+                expert_id * n_up_stride_per_expert * config_.stride * config_.hidden_size
+            ) * ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type);
+            size_t bytes_up_copy = n_up_stride_per_expert * config_.stride * config_.hidden_size * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type);
+            // printf("########## copy size:%ld up_proj_(0x%p, expert_offset:%ld + internal_offset: %ld) to  up_proj_numa_[%d](0x%p, offset: %ld)\n", 
+            //         bytes_up_copy, 
+            //         up_proj_,
+            //         (
+            //             expert_id * config_.intermediate_size * config_.hidden_size
+            //         ) * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type),
+            //         (
+            //             up_stride_offset_per_expert * config_.stride * config_.hidden_size
+            //         ) * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type),
+            //         numa_node_id,
+            //         up_proj_numa_[numa_node_id],
+            //         (
+            //             expert_id * n_up_stride_per_expert * config_.stride * config_.hidden_size
+            //         ) * ggml_type_size(config.up_type) / ggml_blck_size(config.up_type)
+            // );
+
+            memcpy(numa_gate_data_ptr, gate_data_ptr, bytes_gate_copy);
+            memcpy(numa_up_data_ptr, up_data_ptr, bytes_up_copy);
+
+            gate_stride_offset_per_expert += n_gate_stride_per_expert;
+            up_stride_offset_per_expert += n_up_stride_per_expert;
+        }
     }
     printf("========================================================\n");
     #endif
@@ -221,30 +289,63 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     // nth = 2^5 = 32
     // k = 8
     int nth = config_.intermediate_size / config_.stride;
+    int task_num = nth * k;
+#ifdef USE_NUMA
+    std::vector<int> task_splits;
+    std::vector<int> strides_on_numa_nodes;
+    std::vector<int> strides_abs_offset_for_numa_nodes;
+    int n_numa_nodes = config_.e_n_numa_nodes;
+
+    int strides_abs_offset = 0;
+    for (int numa_node_id = 0; numa_node_id < n_numa_nodes; ++numa_node_id) {
+        int strides_on_cur_numa_node = config_.gate_num_stride_on_numa_node(numa_node_id);
+        strides_on_numa_nodes.push_back(strides_on_cur_numa_node);
+        task_splits.push_back(strides_on_cur_numa_node * k);
+        strides_abs_offset_for_numa_nodes.push_back(strides_abs_offset);
+        strides_abs_offset += strides_on_cur_numa_node;
+    }
+
+    backend->do_work_stealing_job_numa_aware(task_num, task_splits, nullptr, [&](int task_id) {
+        int numa_node_id = Backend::numa_node;
+        int nth = strides_on_numa_nodes[numa_node_id];
+        int expert_idx = task_id / nth;
+        uint64_t expert_id = expert_ids[expert_idx];
+        int ith = task_id % nth;
+        int abs_ith = strides_abs_offset_for_numa_nodes[numa_node_id] + ith;
+
+        void* gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * nth  + ith) * config_.stride * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+        float* gate_output_ptr = s_gate_output_[expert_idx] + abs_ith * config_.stride;
+        llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+
+        void* up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * nth + ith) * config_.stride * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+        float* up_output_ptr = s_up_output_[expert_idx] + abs_ith * config_.stride;
+        llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, ggml_internal_get_type_traits(config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+
+        for (int i = abs_ith * config_.stride; i < (abs_ith + 1) * config_.stride; i++) {
+            s_intermediate_fp32_[expert_idx][i] = act_fn(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
+        }
+        if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) == 0) {
+            float* intermediate_fp32_ptr = s_intermediate_fp32_[expert_idx] + abs_ith * config_.stride;
+            void* down_input_ptr = s_down_input_[expert_idx] + abs_ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+            from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+        }
+    }, nullptr); 
+#else
     // k 个 expert 每个 expert 将中间hidden层的计算切成32个长度为64的条带，并行计算
-    backend->do_work_stealing_job(nth * k, nullptr, [&](int task_id) {
+    backend->do_work_stealing_job(task_num, nullptr, [&](int task_id) {
         int expert_idx = task_id / nth;
         uint64_t expert_id = expert_ids[expert_idx];
         int ith = task_id % nth;
         // expert_id号expert的第ith条带的计算
         
-        #ifdef USE_NUMA
-        // 使用numa的话就会从距离当前线程最近的内存地址上获取
-        void* gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-        #else
         // 不使用 numa 时
         // gate_proj shape [experts_size, interm_size, hidden_size]
         void* gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-        #endif
 
         float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
         llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
 
-        #ifdef USE_NUMA
-        void* up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-        #else
         void* up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-        #endif
 
         float* up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
         llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, ggml_internal_get_type_traits(config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
@@ -257,6 +358,7 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
         }
     }, nullptr);
+#endif
     if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) != 0) {
         for (int i = 0; i < k; i++) {
             from_float(s_intermediate_fp32_[i], s_down_input_[i], config_.intermediate_size, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
